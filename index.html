@@ -229,7 +229,7 @@
 
 <script>
 'use strict';
-const APP_VERSION = 'v1';
+const APP_VERSION = 'v2';
 const API = 'https://script.google.com/macros/s/AKfycbz9rJgnHSJwmoqx8yxhwnhv8Ys3iE50E7V4bGauelbAJNlCNO0jWVXBTEnqpq5883I4/exec';
 const CURRENCIES = ['JPY', 'TWD', 'USD', 'KRW', 'EUR', 'HKD', 'THB', 'SGD', 'CNY', 'GBP', 'AUD', 'VND', 'MYR', 'PHP', 'CAD', 'NZD', 'CHF'];
 const MAX_SIDE = 2000;   // 上傳前縮圖：收據小字仍清楚，檔案約 0.7 MB
@@ -244,6 +244,7 @@ const store = {
 let cfg = null;      // 伺服器設定：目前旅程、預設人數、選單、合計
 let entry = null;    // 正在填的這一筆
 let seq = 0;
+let lastSync = 0;    // 上次跟伺服器對時（抓目前旅程與合計）的時間
 
 const pad = n => String(n).padStart(2, '0');
 const today = () => { const d = new Date(); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; };
@@ -346,11 +347,34 @@ function renderRecent(list) {
     `<span class="meta">${esc(x.date.slice(5).replace('-', '/'))} ${esc(x.time)} · ${esc(x.category)}${x.recorder ? ' · ' + esc(x.recorder) : ''}</span></li>`).join('');
 }
 
-async function refresh() {
+// quiet：從背景切回來時自動跑的，失敗就算了（例如在國外沒網路），不跳訊息
+async function refresh(quiet) {
+  lastSync = Date.now();
+  const before = cfg && cfg.trip;
   const r = await api('config');
-  if (r.ok) applyConfig(r);
+  if (r.ok) {
+    applyConfig(r);
+    if (before && r.trip && r.trip !== before) toast(`目前旅程已換成「${r.trip}」`, 4000);
+  } else if (quiet) return;
   else if (r.code === 'auth') showLogin('密碼不對，請重新輸入');
   else toast('沒更新到最新合計：' + r.error);
+}
+
+// 伺服器回報的目前旅程跟畫面上的不一樣（家人換了旅程）：更新畫面，回傳有沒有換
+function syncTrip(trip) {
+  if (!trip || !cfg || trip === cfg.trip) return false;
+  cfg.trip = trip;
+  $('tripName').textContent = trip;
+  store.set('cfg', JSON.stringify(cfg));
+  return true;
+}
+
+// 從背景切回來：重抓目前旅程與合計（家人可能換了旅程或剛記了帳），順便檢查網頁有沒有新版
+function resync() {
+  if (document.visibilityState !== 'visible' || $('main').classList.contains('hidden')) return;
+  if (Date.now() - lastSync < 30000) return;
+  refresh(true);
+  if (navigator.serviceWorker) navigator.serviceWorker.getRegistration().then(reg => reg && reg.update()).catch(() => {});
 }
 
 // ---------------- 記一筆 ----------------
@@ -536,12 +560,13 @@ async function onFile(file) {
   entry.image = img;
   if (img.preview) { $('photo').src = img.preview; show('photo'); }
   startCountdown('上傳並辨識中');
-  const r = await api('scan', { trip: cfg.trip, image: img.b64, mime: img.mime }, 120000);
+  const r = await api('scan', { image: img.b64, mime: img.mime }, 120000);
   if (!entry || entry.seq !== mySeq) {          // 使用者在等待時按了取消
     if (r.ok && r.fileId) api('cancel', { fileId: r.fileId });
     return;
   }
   if (!r.ok) { setStatus('err', `${r.code === 'auth' ? '密碼不對' : r.error}。可以直接手動填，存的時候會一起附上照片。`); return; }
+  if (syncTrip(r.trip)) toast(`目前旅程已換成「${r.trip}」，這筆會記在那趟`, 4000);
   entry.fileId = r.fileId;
   entry.image = null;   // 照片已經在雲端
   if (!r.receipt) { setStatus('err', r.error || '沒辨識出來，請手動填'); saveDraft(); return; }
@@ -580,17 +605,21 @@ async function save() {
   if (f.amount === '' || !(f.amount >= 0)) return toast('請填金額');
   const btn = $('saveBtn');
   busy(btn, true, '儲存中…');
-  const payload = { trip: cfg.trip, fields: f, fileId: entry.fileId, recorder: store.get('name') };
+  // 不送旅程：記到哪一趟由伺服器照目前旅程決定
+  const payload = { fields: f, fileId: entry.fileId, recorder: store.get('name') };
   if (!entry.fileId && entry.image) { payload.image = entry.image.b64; payload.mime = entry.image.mime; }
   const r = await api('save', payload, 60000);
   busy(btn, false);
   if (!r.ok) { toast('沒存成功：' + (r.code === 'auth' ? '密碼不對' : r.error), 4000); return; }
   const twd = f.rate > 0 ? Math.round(f.amount * f.rate) : 0;
+  const moved = syncTrip(r.trip);
   closeEntry();
-  toast(`✓ 已記：${f.store || '一筆'}${twd ? ' NT$' + fmt(twd) : ''}`);
+  if (moved) toast(`✓ 已記到「${r.trip}」（目前旅程已換）`, 4000);
+  else toast(`✓ 已記：${f.store || '一筆'}${twd ? ' NT$' + fmt(twd) : ''}`);
   renderTotals(r.totals);
   renderRecent(r.recent);
   if (cfg) { cfg.totals = r.totals; cfg.recent = r.recent; store.set('cfg', JSON.stringify(cfg)); }
+  if (moved) refresh(true);   // 旅程清單也跟著更新
 }
 
 function cancelEntry() {
@@ -641,6 +670,7 @@ async function switchTrip(name) {
   const r = await api('trip', { trip: name });
   if (!r.ok) return toast('沒切換成功：' + r.error);
   hide('trips');
+  syncTrip(r.trip);   // 先換掉畫面上的，下面 refresh 才不會再跳一次「已換成」
   toast('目前旅程：' + r.trip);
   await refresh();
 }
@@ -689,6 +719,8 @@ function wire() {
   $('settingsClose').onclick = () => hide('settings');
   $('setSave').onclick = saveSettings;
   $('forceUpdate').onclick = forceUpdate;
+  document.addEventListener('visibilitychange', resync);
+  window.addEventListener('pageshow', e => { if (e.persisted) resync(); });
 
   $('fCategory').onclick = e => {
     const b = e.target.closest('.chip');

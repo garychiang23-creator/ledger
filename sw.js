@@ -2,7 +2,7 @@
 // 離線快取：HTML 走「網路優先」（有網拿最新版），其餘「快取優先」。
 // 記帳 API 在 script.google.com，跨網域的 POST 不經過這裡。
 // 改版時把 VER +1，並和 index.html 的 APP_VERSION 一起改（push_deploy.js 會檢查）。
-const VER = 1;
+const VER = 2;
 const CACHE = 'ledger-v' + VER;
 const ASSETS = [
   './',
