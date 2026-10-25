@@ -54,8 +54,9 @@
   .totals { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; }
   .totals .label { font-size: 13px; color: var(--muted); }
   .totals .num { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; }
-  .totals .local { font-size: 14px; color: var(--muted); font-variant-numeric: tabular-nums; margin-top: 2px; }
-  .totals .local:empty { display: none; }
+  .totals .alt { font-size: 14px; color: var(--muted); font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .totals .alt:empty { display: none; }
+  .totals .nw { white-space: nowrap; }
   .totals .sub { grid-column: 1 / -1; font-size: 13px; color: var(--muted); }
 
   .actions { display: grid; gap: 10px; margin-bottom: 14px; }
@@ -155,8 +156,8 @@
       <button id="settingsBtn" class="icon-btn" aria-label="設定">⚙︎</button>
     </header>
     <div class="card totals">
-      <div><div class="label">今天</div><div class="num" id="sumToday">NT$0</div><div class="local" id="localToday"></div></div>
-      <div><div class="label">這趟</div><div class="num" id="sumTrip">NT$0</div><div class="local" id="localTrip"></div></div>
+      <div><div class="label">今天</div><div class="num" id="sumToday">NT$0</div><div class="alt" id="sumTodayAlt"></div></div>
+      <div><div class="label">這趟</div><div class="num" id="sumTrip">NT$0</div><div class="alt" id="sumTripAlt"></div></div>
       <div class="sub" id="sumCount">0 筆</div>
     </div>
     <div class="actions">
@@ -233,7 +234,7 @@
 
 <script>
 'use strict';
-const APP_VERSION = 'v3';
+const APP_VERSION = 'v4';
 const API = 'https://script.google.com/macros/s/AKfycbz9rJgnHSJwmoqx8yxhwnhv8Ys3iE50E7V4bGauelbAJNlCNO0jWVXBTEnqpq5883I4/exec';
 const CURRENCIES = ['JPY', 'TWD', 'USD', 'KRW', 'EUR', 'HKD', 'THB', 'SGD', 'CNY', 'GBP', 'AUD', 'VND', 'MYR', 'PHP', 'CAD', 'NZD', 'CHF'];
 const MAX_SIDE = 2000;   // 上傳前縮圖：收據小字仍清楚，檔案約 0.7 MB
@@ -345,15 +346,23 @@ function applyConfig(r) {
   renderRecent(r.recent);
 }
 
-// 外幣小計列在台幣下面，主要幣別在前；台幣付的只算在 NT$ 裡，沒有外幣就不顯示
-const localSums = list => (list || []).map(x => money(x.amt, x.cur)).join('・');
+// 合計欄跟每筆一致：只有一種外幣時當地金額大字、台幣小字（有用台幣付的就註明）；
+// 沒有外幣只顯示台幣；兩種以上外幣不能相加，改成台幣大字、各幣別列在下面（主要幣別在前）
+function renderSum(numEl, altEl, twd, local, twdPaid) {
+  const fx = local || [];
+  const one = fx.length === 1;
+  const big = one ? money(fx[0].amt, fx[0].cur) : 'NT$' + fmt(twd);
+  numEl.textContent = big;
+  numEl.style.fontSize = big.length >= 12 ? '16px' : big.length >= 11 ? '18px' : big.length >= 10 ? '20px' : '';   // 韓元、越南盾這類大數字縮小，免得擠出欄位
+  altEl.innerHTML = one
+    ? `NT$${fmt(twd)}${twdPaid > 0 ? '<span class="nw">（含台幣付款）</span>' : ''}`
+    : fx.map(x => `<span class="nw">${esc(money(x.amt, x.cur))}</span>`).join('・');
+}
 
 function renderTotals(t) {
   t = t || { today: 0, trip: 0, count: 0 };
-  $('sumToday').textContent = 'NT$' + fmt(t.today);
-  $('sumTrip').textContent = 'NT$' + fmt(t.trip);
-  $('localToday').textContent = localSums(t.todayLocal);
-  $('localTrip').textContent = localSums(t.tripLocal);
+  renderSum($('sumToday'), $('sumTodayAlt'), t.today, t.todayLocal, t.todayTwdPaid);
+  renderSum($('sumTrip'), $('sumTripAlt'), t.trip, t.tripLocal, t.tripTwdPaid);
   $('sumCount').textContent = `這趟共 ${t.count} 筆`;
 }
 
