@@ -58,6 +58,10 @@
   .totals .alt:empty { display: none; }
   .totals .nw { white-space: nowrap; }
   .totals .sub { grid-column: 1 / -1; font-size: 13px; color: var(--muted); }
+  /* 會無聲少算的兩件事（沒匯率、IC 卡加值沒記）直接寫在合計下面 */
+  .totals .warn { grid-column: 1 / -1; font-size: 13px; padding: 8px 10px; border-radius: 10px; background: var(--warn-bg); color: var(--warn-ink); }
+  .totals .warn p { margin: 0; }
+  .totals .warn p + p { margin-top: 6px; }
 
   .actions { display: grid; gap: 10px; margin-bottom: 14px; }
   .big {
@@ -138,6 +142,7 @@
   .big.danger { background: none; color: var(--danger); border: 1px solid var(--line); min-height: 48px; font-size: 16px; font-weight: 600; margin-top: 8px; }
   .big.danger.armed { background: var(--danger); color: var(--bg); border-color: var(--danger); }
   .quick { width: 100%; min-height: 44px; margin: 4px 0; border-radius: 12px; border: 1px dashed var(--line); background: var(--card); font-size: 15px; }
+  .quick[aria-pressed="true"] { border-style: solid; border-color: var(--brand); background: var(--brand-soft); font-weight: 700; }
   .save-bar { position: sticky; bottom: 0; background: var(--bg); padding: 12px 0 calc(12px + env(safe-area-inset-bottom)); }
 
   .trip-list { list-style: none; margin: 0; padding: 0; }
@@ -177,13 +182,14 @@
   <!-- 主畫面 -->
   <section id="main" class="hidden">
     <header class="top">
-      <button id="tripBtn" class="trip-btn" aria-label="切換旅程"><small>目前旅程 ▾</small><span id="tripName">—</span></button>
+      <button id="tripBtn" class="trip-btn" aria-label="切換旅程"><small id="tripMeta">目前旅程 ▾</small><span id="tripName">—</span></button>
       <button id="settingsBtn" class="icon-btn" aria-label="設定">⚙︎</button>
     </header>
     <div class="card totals">
       <div><div class="label">今天</div><div class="num" id="sumToday">NT$0</div><div class="alt" id="sumTodayAlt"></div></div>
       <div><div class="label">這趟</div><div class="num" id="sumTrip">NT$0</div><div class="alt" id="sumTripAlt"></div></div>
       <div class="sub" id="sumCount">0 筆</div>
+      <div class="warn hidden" id="sumWarn"></div>
     </div>
     <div class="actions">
       <button id="scanBtn" class="big">📷 拍收據</button>
@@ -214,7 +220,7 @@
     <div id="status" class="status hidden"></div>
     <button id="retryBtn" type="button" class="link-btn hidden">重新辨識</button>
     <div id="notes"></div>
-    <button id="topupBtn" type="button" class="quick hidden">🚃 這筆是 IC 卡加值（Suica、ICOCA 等）</button>
+    <button id="topupBtn" type="button" class="quick" aria-pressed="false">🚃 這筆是 IC 卡加值（Suica、ICOCA 等）</button>
 
     <div class="field"><label for="fStore">店名</label><input id="fStore" autocomplete="off"></div>
     <div class="row">
@@ -248,6 +254,11 @@
     <p class="hint">全家共用同一個「目前旅程」，切換後大家拍的都記到這一趟。</p>
     <ul id="tripList" class="trip-list"></ul>
     <div class="field"><label for="newTrip">新的一趟</label><input id="newTrip" placeholder="例如：2027_日本_1月" autocomplete="off"></div>
+    <div class="row">
+      <div class="field"><label for="newStart">出發日（可不填）</label><input id="newStart" type="date"></div>
+      <div class="field"><label for="newEnd">回程日（可不填）</label><input id="newEnd" type="date"></div>
+    </div>
+    <p class="hint">填了出發、回程，天數才算得準；出發前付的機票、訂房會另外列成「行前」。之後要補或改，到試算表的「旅程」分頁。</p>
     <button id="addTrip" class="big secondary">開新旅程</button>
   </div>
 </section>
@@ -269,12 +280,15 @@
 
 <script>
 'use strict';
-const APP_VERSION = 'v5';
+const APP_VERSION = 'v6';
 const API = 'https://script.google.com/macros/s/AKfycbz9rJgnHSJwmoqx8yxhwnhv8Ys3iE50E7V4bGauelbAJNlCNO0jWVXBTEnqpq5883I4/exec';
 const CURRENCIES = ['JPY', 'TWD', 'USD', 'KRW', 'EUR', 'HKD', 'THB', 'SGD', 'CNY', 'GBP', 'AUD', 'VND', 'MYR', 'PHP', 'CAD', 'NZD', 'CHF'];
 const MAX_SIDE = 2000;   // 上傳前縮圖：收據小字仍清楚，檔案約 0.7 MB
 const THUMB_SIDE = 160;  // 待核對清單的小圖
 const IC = 'IC卡';       // 交通 IC 卡付的只記不算（加值那筆已經算過），規則在後端 Code.js
+// Gemini 免費額度：主力模型每分鐘 5 張（每天 20 張）。一次送太快，超過的會被後端換成次一級模型去讀，
+// 所以這裡自己放慢：任何 62 秒內最多開始 5 次辨識，滿了就排隊等。
+const SCAN_PER_MIN = 5;
 
 const $ = id => document.getElementById(id);
 const store = {
@@ -292,6 +306,10 @@ let rowsById = new Map();   // 畫面上列出的紀錄，點了要改
 let queue = [];      // 待核對：照片＋辨識結果，同步存進 IndexedDB（關掉 App 也不會丟）
 let scanning = '';   // 正在辨識的那張
 let scanStart = 0;
+let scanTimes = [];  // 最近幾次開始辨識的時間（放慢用；存在本機，重開 App 也算數）
+let paceUntil = 0;   // 這個時間之前不送下一張
+try { scanTimes = JSON.parse(store.get('scanTimes') || '[]').filter(t => typeof t === 'number'); } catch (_) { scanTimes = []; }
+let SCAN_WINDOW_MS = Number(store.get('paceMs')) || 62000;   // 測試會改短（本機存的 ledger.paceMs，或直接改這個變數）
 
 const pad = n => String(n).padStart(2, '0');
 const today = () => { const d = new Date(); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; };
@@ -441,8 +459,24 @@ function applyConfig(r) {
   cfg = r;
   store.set('cfg', JSON.stringify(r));
   $('tripName').textContent = r.trip || '還沒有旅程，點這裡開一趟';
+  renderTripMeta();
   renderTotals(r.totals);
   renderRecent(r.recent);
+}
+
+// 「第 3 天／共 10 天」：這趟在試算表「旅程」有填出發、回程才顯示
+function tripDays(info) {
+  if (!info || !info.start || !info.end) return '';
+  const n = s => { const [y, m, d] = s.split('-').map(Number); return Math.round(Date.UTC(y, m - 1, d) / 86400000); };
+  const t = n(today()), a = n(info.start), b = n(info.end);
+  if (b < a) return '';
+  if (t < a) return `出發前 ${a - t} 天`;
+  if (t > b) return '已結束';
+  return `第 ${t - a + 1} 天／共 ${b - a + 1} 天`;
+}
+function renderTripMeta() {
+  const d = tripDays(cfg && cfg.tripInfo);
+  $('tripMeta').textContent = '目前旅程 ▾' + (d ? '　' + d : '');
 }
 
 // 新增、修改、刪除完：用伺服器回的合計與紀錄更新畫面
@@ -474,6 +508,16 @@ function renderTotals(t) {
   const more = $('moreBtn');
   more.classList.toggle('hidden', !showAll && !(t.count > 8));
   more.textContent = showAll ? '收起' : `看全部 ${t.count} 筆`;
+  // 兩件會無聲少算的事：外幣沒有匯率（台幣是空的）、IC 卡付的收據比記到的加值多（有加值沒記）
+  const warn = [];
+  if (t.noRate > 0) warn.push(`⚠️ 有 ${t.noRate} 筆沒有匯率，還沒算進台幣合計。點下面標「沒匯率」的那筆，補上匯率再存。`);
+  if (t.icShort > 0) {
+    warn.push(`⚠️ IC 卡付的收據比記到的加值多 ${money(t.icShort, t.icCur || 'JPY')}：有加值還沒記？` +
+      '卡裡原本就有錢的話，到試算表「旅程」分頁填出發前餘額。');
+  }
+  const box = $('sumWarn');
+  box.innerHTML = warn.map(w => `<p>${esc(w)}</p>`).join('');
+  box.classList.toggle('hidden', !warn.length);
 }
 
 function renderRecent(list) {
@@ -490,10 +534,12 @@ function renderRecent(list) {
     const twd = fx && x.twd > 0 ? `<span class="twd">NT$${fmt(x.twd)}</span>` : '';
     const amt = fx || ic ? money(x.amount, x.currency || 'TWD') : 'NT$' + fmt(x.twd);
     const cls = ['rec', twd ? 'fx' : '', ic ? 'ic' : ''].filter(Boolean).join(' ');
+    const tags = (ic ? ' <span class="tag">IC卡・不計</span>' : '') + (x.topup ? ' <span class="tag">IC加值</span>' : '') +
+      (x.noRate ? ' <span class="tag">沒匯率</span>' : '');
     return `<li><button type="button" class="${cls}" data-id="${esc(x.id)}"${x.id ? '' : ' disabled'}>` +
       `<span class="store">${esc(x.store)}</span><span class="amt">${esc(amt)}</span>` +
       `<span class="meta">${esc(x.date.slice(5).replace('-', '/'))} ${esc(x.time)} · ${esc(x.category)}${x.recorder ? ' · ' + esc(x.recorder) : ''}` +
-      `${ic ? ' <span class="tag">IC卡・不計</span>' : ''}</span>${twd}</button></li>`;
+      `${tags}</span>${twd}</button></li>`;
   }).join('');
 }
 
@@ -514,7 +560,9 @@ async function refresh(quiet) {
 function syncTrip(trip) {
   if (!trip || !cfg || trip === cfg.trip) return false;
   cfg.trip = trip;
+  cfg.tripInfo = null;          // 新旅程的出發、回程日等下一次重抓設定才知道
   $('tripName').textContent = trip;
+  renderTripMeta();
   store.set('cfg', JSON.stringify(cfg));
   return true;
 }
@@ -534,6 +582,7 @@ function itemStatus(it) {
   if (it.state === 'failed') return [`${it.scanError || '出錯了'}，點一下手動填`, 'err'];
   if (scanning === it.id) return ['辨識中…', 'busy'];
   if (it.netError) return [`${it.netError}，等一下自動重試`, 'wait'];
+  if (paceUntil > Date.now()) return ['排隊中（免費辨識每分鐘 5 張，稍等）', 'wait'];
   return ['排隊等辨識', 'wait'];
 }
 
@@ -588,18 +637,36 @@ async function pump() {
   const now = Date.now();
   const it = queue.find(x => x.state === 'queued' && (x.nextTry || 0) <= now);
   if (!it) { schedulePump(); return; }
+  // 放慢：這一分鐘已經送滿 5 張就等最早那張滿一分鐘再送，免得被換成次一級模型
+  scanTimes = scanTimes.filter(t => t <= now && now - t < SCAN_WINDOW_MS);
+  if (scanTimes.length >= SCAN_PER_MIN) {
+    paceUntil = scanTimes[0] + SCAN_WINDOW_MS;
+    schedulePump();
+    renderQueue();
+    onItemChanged(it);
+    return;
+  }
+  paceUntil = 0;
+  scanTimes.push(now);
+  store.set('scanTimes', JSON.stringify(scanTimes));
   scanning = it.id;
   scanStart = Date.now();
   renderQueue();
   onItemChanged(it);
   const r = await api('scan', { image: it.b64, mime: it.mime, qid: it.id }, 120000);
   scanning = '';
+  // 沒真的用到辨識額度的不算：一下子就連不上（斷線）、密碼錯、後端回的是上次辨識過的結果
+  if ((r.net && Date.now() - scanStart < 5000) || r.code === 'auth' || r.code === 'locked' || r.cached) {
+    scanTimes = scanTimes.filter(t => t !== now);
+    store.set('scanTimes', JSON.stringify(scanTimes));
+  }
   const cur = queue.find(x => x.id === it.id);
   if (!cur) {                                   // 辨識的時候被丟掉了：雲端那張也丟掉
     if (r.ok && r.fileId) api('cancel', { fileId: r.fileId });
   } else {
     if (r.ok) {
       Object.assign(cur, { state: 'ready', fileId: r.fileId, receipt: r.receipt || null, netError: '',
+        scanMs: Date.now() - scanStart,          // 這張等了多久（存檔時一起記下來）
         scanError: r.receipt ? '' : (r.error || '沒辨識出來') });
       if (syncTrip(r.trip)) toast(`目前旅程已換成「${r.trip}」，存的時候會記在那趟`, 4000);
     } else if (r.net || r.code === 'auth' || r.code === 'locked') {
@@ -619,7 +686,7 @@ async function pump() {
 function schedulePump() {
   clearTimeout(pumpTimer);
   const next = queue.filter(x => x.state === 'queued').map(x => x.nextTry || 0);
-  if (next.length) pumpTimer = setTimeout(pump, Math.max(1000, Math.min(...next) - Date.now()));
+  if (next.length) pumpTimer = setTimeout(pump, Math.max(1000, Math.max(Math.min(...next), paceUntil) - Date.now()));
 }
 
 // 有網路了、切回 App：等著重試的照片馬上送
@@ -671,6 +738,13 @@ function getCategory() {
 }
 function setPeople(n) { $('fPeople').value = $('fPeople').textContent = String(Math.max(1, Math.min(20, n))); }
 function getPeople() { return Number($('fPeople').textContent) || 1; }
+// 「這筆是 IC 卡加值」開關：後端會在試算表「類型」欄標 IC加值，用來檢查 IC 卡付的收據有沒有比加值多
+function setTopup(on) {
+  const b = $('topupBtn');
+  b.setAttribute('aria-pressed', String(!!on));
+  b.textContent = on ? '✓ 這筆是 IC 卡加值（算進合計）' : '🚃 這筆是 IC 卡加值（Suica、ICOCA 等）';
+}
+function getTopup() { return $('topupBtn').getAttribute('aria-pressed') === 'true'; }
 
 // 把存起來的欄位填回表單（keys：只填這幾欄）
 function applyFields(f, keys) {
@@ -678,7 +752,7 @@ function applyFields(f, keys) {
     store: () => setVal('fStore', f.store), date: () => setVal('fDate', f.date), time: () => setVal('fTime', f.time),
     category: () => setCategory(f.category), amount: () => setVal('fAmount', f.amount), currency: () => ensureCurrency(f.currency),
     rate: () => setVal('fRate', f.rate), people: () => setPeople(f.people), payment: () => setPayment(f.payment),
-    items: () => setVal('fItems', f.items), notes: () => setVal('fNotes', f.notes),
+    items: () => setVal('fItems', f.items), notes: () => setVal('fNotes', f.notes), topup: () => setTopup(f.topup),
   };
   keys.forEach(k => put[k] && put[k]());
   autosize($('fItems'));
@@ -689,7 +763,7 @@ function openEntry(mode, opts = {}) {
   buildSelects();
   if (entry && entry.photoUrl) URL.revokeObjectURL(entry.photoUrl);
   entry = { mode, seq: ++seq, qid: opts.qid || '', editId: opts.editId || '', manualId: opts.manualId || newId(),
-    dirty: new Set(), rateTouched: false, photoUrl: '' };
+    dirty: new Set(), rateTouched: false, photoUrl: '', openAt: Date.now() };
   $('entryTitle').textContent = { manual: '手動記一筆', item: '核對收據', edit: '修改這筆' }[mode];
   $('entryCancel').textContent = mode === 'item' ? '返回' : '取消';
   $('saveBtn').textContent = mode === 'edit' ? '儲存修改' : '儲存';
@@ -697,7 +771,7 @@ function openEntry(mode, opts = {}) {
   disarm(d);
   d.textContent = mode === 'edit' ? '刪除這筆' : '丟掉這張';
   d.classList.toggle('hidden', mode === 'manual');
-  $('topupBtn').classList.toggle('hidden', mode !== 'manual');
+  setTopup(false);
   hide('retryBtn');
   const photo = mode === 'item';
   setVal('fStore', '');
@@ -754,7 +828,7 @@ function openEdit(id) {
   const r = rowsById.get(id);
   if (!r) return;
   openEntry('edit', { editId: id });
-  const keys = ['store', 'date', 'time', 'category', 'amount', 'currency', 'rate', 'people', 'payment', 'items', 'notes'];
+  const keys = ['store', 'date', 'time', 'category', 'amount', 'currency', 'rate', 'people', 'payment', 'items', 'notes', 'topup'];
   applyFields(r, keys);
   keys.forEach(k => entry.dirty.add(k));
   entry.rateTouched = Number(r.rate) > 0;
@@ -798,7 +872,7 @@ function showItemState(it) {
     else if (it.netError) {
       setStatus('err', `${it.netError}。照片先存在這支手機裡，有網路會自動重試；也可以直接手動填。`);
       show('retryBtn');
-    } else setStatus('loading', '排隊等辨識…');
+    } else setStatus('loading', paceUntil > Date.now() ? '排隊中（免費辨識每分鐘 5 張，稍等）…' : '排隊等辨識…');
     return;
   }
   if (it.state === 'failed') {
@@ -809,7 +883,8 @@ function showItemState(it) {
   const rc = it.receipt;
   if (!rc || it.scanError) { setStatus('err', `${it.scanError || '沒辨識出來'}，請手動填。`); return; }
   if (!rc.total && !rc.date) { setStatus('err', '這張看不出是收據，可以手動填，或按下面的「丟掉這張」。'); return; }
-  setStatus('ok', '辨識完成，請核對一下再存。');
+  setStatus('ok', rc.fallback ? '辨識完成。這張是備援模型讀的（主力模型今天的免費額度用完或忙線），品名翻譯可能差一點，請核對再存。'
+    : '辨識完成，請核對一下再存。');
   renderNotes(rc.checks, rc.duplicates);
 }
 
@@ -838,7 +913,11 @@ function updateCalc() {
     const p = getPeople();
     html = `台幣 <b>NT$${fmt(twd)}</b>` + (p > 1 && !ic ? `　每人 NT$${fmt(twd / p)}` : '');
   }
-  if (ic) html += (html ? '<br>' : '') + '<span class="ic-note">IC 卡付的只記不算進合計（加值那筆已經算過）</span>';
+  const topup = getTopup();
+  const note = ic && topup ? 'IC 卡加值的付款方式不能選「IC卡」，請改成加值時付錢的方式（現金、信用卡）'
+    : ic ? 'IC 卡付的只記不算進合計（加值那筆已經算過）'
+    : topup ? 'IC 卡加值：這筆算進合計；之後用 IC 卡付的收據只記不算' : '';
+  if (note) html += (html ? '<br>' : '') + `<span class="ic-note">${note}</span>`;
   $('calc').innerHTML = html;
 }
 
@@ -868,6 +947,7 @@ function fillFromReceipt(rc, opening) {
   put('fAmount', 'amount', rc.total);
   if (!entry.dirty.has('currency') && rc.currency) ensureCurrency(rc.currency);
   if (!entry.dirty.has('payment') && rc.payment) setPayment(rc.payment);
+  if (!entry.dirty.has('topup')) setTopup(!!rc.icTopup);
   put('fItems', 'items', rc.itemsText);
   if (!entry.rateTouched) {
     if (rc.rate) setVal('fRate', rc.rate);
@@ -943,7 +1023,29 @@ function collect() {
     payment: $('fPayment').value,
     items: $('fItems').value.trim(),
     notes: $('fNotes').value.trim(),
+    topup: getTopup(),
   };
+}
+
+// 存檔時順便記下這一筆的過程：哪個模型讀的、等了幾秒、表單開了幾秒、辨識結果被改了哪幾欄。
+// 回來後看這些數字決定要不要「沒問題的收據免核對直接入帳」、要不要換模型，不影響記帳。
+function buildMeta(e, f) {
+  const sec = ms => Math.round(ms / 100) / 10;
+  const m = { app: APP_VERSION, mode: e.mode, open: sec(Date.now() - e.openAt) };
+  const it = e.mode === 'item' && queue.find(x => x.id === e.qid);
+  if (!it) return m;
+  m.open = sec((it.openMs || 0) + (Date.now() - e.openAt));
+  if (it.scanMs) m.scan = sec(it.scanMs);
+  const rc = it.receipt;
+  if (!rc || it.scanError) { m.mode = 'itemfail'; return m; }      // 沒辨識出來、整張手填
+  if (rc.model) m.model = rc.model;
+  m.fb = !!rc.fallback;
+  const txt = v => String(v == null ? '' : v).trim();
+  const got = { store: rc.store, date: rc.date, time: rc.time, category: rc.category, currency: rc.currency, payment: rc.payment, items: rc.itemsText };
+  m.chg = Object.keys(got).filter(k => txt(f[k]) !== txt(got[k]));
+  if (Number(f.amount) !== Number(rc.total)) m.chg.push('amount');
+  if (!!f.topup !== !!rc.icTopup) m.chg.push('topup');
+  return m;
 }
 
 async function save() {
@@ -952,6 +1054,7 @@ async function save() {
   const f = collect();
   if (!f.date) return toast('請填日期');
   if (f.amount === '' || !(f.amount >= 0)) return toast('請填金額');
+  if (f.topup && f.payment === IC) return toast('IC 卡加值的付款方式不能選「IC卡」，請改成現金或信用卡', 4500);
   if (e.mode === 'item') persistItem();
   const btn = $('saveBtn');
   busy(btn, true, '儲存中…');
@@ -960,7 +1063,7 @@ async function save() {
     r = await api('update', { id: e.editId, fields: f }, 60000);
   } else {
     // 不送旅程：記到哪一趟由伺服器照目前旅程決定。qid 讓重送不會記兩次
-    const payload = { fields: f, recorder: store.get('name'), qid: e.mode === 'item' ? e.qid : e.manualId };
+    const payload = { fields: f, recorder: store.get('name'), qid: e.mode === 'item' ? e.qid : e.manualId, meta: buildMeta(e, f) };
     const it = e.mode === 'item' && queue.find(x => x.id === e.qid);
     if (it) {
       payload.fileId = it.fileId;
@@ -982,13 +1085,15 @@ async function save() {
     : moved ? `✓ 已記到「${r.trip}」（目前旅程已換）`
     : `✓ 已記：${f.store || '一筆'}${twd && f.payment !== IC ? ' NT$' + fmt(twd) : ''}`;
   if (f.payment === IC && e.mode !== 'edit') msg += '（IC 卡付的不算進合計）';
+  // 匯率來源抓不到、表單上也沒填：存是存了，但台幣是空的，不會算進任何合計
+  if (r.noRate) msg = `⚠️ ${e.mode === 'edit' ? '已修改' : '已記'}，但這筆沒有匯率，還沒算進台幣合計。點它補上匯率再存`;
   if (entry === e) {
     closeEntry();
     // 核對完一張，直接接下一張：先挑辨識好的，再來是正在辨識的那張
     const next = e.mode === 'item' && (queue.find(x => x.state !== 'queued') || queue.find(x => x.id === scanning));
     if (next) { openItem(next.id); msg += '，下一張'; }
   }
-  toast(msg, moved ? 4000 : 2600);
+  toast(msg, r.noRate ? 7000 : moved ? 4000 : 2600);
   if (moved) refresh(true);   // 旅程清單也跟著更新
 }
 
@@ -1051,6 +1156,8 @@ function persistItem() {
   it.fields = collect();
   it.dirty = [...entry.dirty];
   it.rateTouched = entry.rateTouched;
+  it.openMs = (it.openMs || 0) + (Date.now() - entry.openAt);   // 這張的表單累計開了多久（返回再打開要接著算）
+  entry.openAt = Date.now();
   qSave(it);
   renderQueue();
 }
@@ -1060,7 +1167,7 @@ function restoreDraft() {
   try { d = JSON.parse(store.get('draft') || 'null'); } catch (_) { d = null; }
   if (!d || Date.now() - d.t > 2 * 86400000) { store.del('draft'); return; }
   openEntry('manual', { manualId: d.id });
-  const keys = ['store', 'date', 'time', 'category', 'amount', 'currency', 'rate', 'people', 'payment', 'items', 'notes'];
+  const keys = ['store', 'date', 'time', 'category', 'amount', 'currency', 'rate', 'people', 'payment', 'items', 'notes', 'topup'];
   applyFields(d.fields, keys);
   keys.forEach(k => entry.dirty.add(k));
   entry.rateTouched = !!d.rateTouched;
@@ -1078,14 +1185,18 @@ function openTrips() {
   const d = new Date();
   $('newTrip').placeholder = `例如：${d.getFullYear()}_日本_${d.getMonth() + 1}月`;
   setVal('newTrip', '');
+  setVal('newStart', '');
+  setVal('newEnd', '');
   show('trips');
 }
 
-async function switchTrip(name) {
+// start、end：開新旅程時填的出發、回程日（YYYY-MM-DD，可以空）；從清單切換時不帶，後端不會動原本的日期
+async function switchTrip(name, start, end) {
   name = String(name || '').trim();
   if (!name) return toast('請輸入旅程名稱');
-  const r = await api('trip', { trip: name });
-  if (!r.ok) return toast('沒切換成功：' + r.error);
+  if (start && end && end < start) return toast('回程日不能比出發日早');
+  const r = await api('trip', { trip: name, start: start || '', end: end || '' });
+  if (!r.ok) return toast('沒切換成功：' + r.error, 4000);
   hide('trips');
   syncTrip(r.trip);   // 先換掉畫面上的，下面 refresh 才不會再跳一次「已換成」
   toast('目前旅程：' + r.trip);
@@ -1136,23 +1247,35 @@ function wire() {
   $('retryBtn').onclick = retryScan;
   $('topupBtn').onclick = () => {
     if (!entry) return;
-    setVal('fStore', 'IC 卡加值');
-    setCategory('交通');
-    setPayment('現金');
-    ['store', 'category', 'payment'].forEach(k => entry.dirty.add(k));
+    const on = !getTopup();
+    setTopup(on);
+    entry.dirty.add('topup');
+    if (on) {
+      // 打開：分類一定是交通；店名空的就填「IC 卡加值」；付款不能是 IC卡（手動記一筆預設現金）
+      if (!$('fStore').value.trim()) { setVal('fStore', 'IC 卡加值'); entry.dirty.add('store'); }
+      setCategory('交通');
+      entry.dirty.add('category');
+      if ($('fPayment').value === IC || (entry.mode === 'manual' && !entry.dirty.has('payment'))) { setPayment('現金'); entry.dirty.add('payment'); }
+      if (entry.mode === 'manual') $('fAmount').focus();
+    }
     updateCalc();
     saveDraft();
-    $('fAmount').focus();
   };
   $('tripBtn').onclick = openTrips;
   $('tripsClose').onclick = () => hide('trips');
   $('tripList').onclick = e => { const b = e.target.closest('button[data-trip]'); if (b) switchTrip(b.dataset.trip); };
-  $('addTrip').onclick = () => switchTrip($('newTrip').value);
+  $('addTrip').onclick = () => switchTrip($('newTrip').value, $('newStart').value, $('newEnd').value);
   $('settingsBtn').onclick = openSettings;
   $('settingsClose').onclick = () => hide('settings');
   $('setSave').onclick = saveSettings;
   $('forceUpdate').onclick = forceUpdate;
   document.addEventListener('visibilitychange', resync);
+  // 手機鎖著、切到別的 App 的時間不算進「表單開了多久」
+  document.addEventListener('visibilitychange', () => {
+    if (!entry) return;
+    if (document.visibilityState === 'hidden') entry.hiddenAt = Date.now();
+    else if (entry.hiddenAt) { entry.openAt += Date.now() - entry.hiddenAt; entry.hiddenAt = 0; }
+  });
   window.addEventListener('pageshow', e => { if (e.persisted) resync(); });
   window.addEventListener('online', retryNow);
 
