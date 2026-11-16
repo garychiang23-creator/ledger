@@ -268,7 +268,9 @@
   <div class="sheet-head"><button id="settingsClose" class="link-btn">完成</button><h1>設定</h1><span style="width:44px"></span></div>
   <div class="wrap">
     <div class="field"><label for="setName">你的名字（記錄人）</label><input id="setName" autocomplete="nickname"></div>
-    <div class="field"><label for="setPass">密碼</label><input id="setPass" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
+    <div class="field"><label for="setPass">密碼（這支手機記住的）</label><input id="setPass" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <p class="hint">全家共用的那一個。在這裡不能換密碼；填的密碼不對就不會存，原本的會留著。</p></div>
+    <p id="setErr" class="note dup hidden"></p>
     <button id="setSave" class="big secondary">儲存設定</button>
     <p class="hint" style="margin-top:18px">帳目都在 Google 試算表「旅遊帳本」：總覽、每日小計、明細都看得到，也可以直接改。</p>
     <button id="forceUpdate" class="big secondary" style="margin-top:12px">重新載入最新版</button>
@@ -280,7 +282,7 @@
 
 <script>
 'use strict';
-const APP_VERSION = 'v6';
+const APP_VERSION = 'v7';
 const API = 'https://script.google.com/macros/s/AKfycbz9rJgnHSJwmoqx8yxhwnhv8Ys3iE50E7V4bGauelbAJNlCNO0jWVXBTEnqpq5883I4/exec';
 const CURRENCIES = ['JPY', 'TWD', 'USD', 'KRW', 'EUR', 'HKD', 'THB', 'SGD', 'CNY', 'GBP', 'AUD', 'VND', 'MYR', 'PHP', 'CAD', 'NZD', 'CHF'];
 const MAX_SIDE = 2000;   // 上傳前縮圖：收據小字仍清楚，檔案約 0.7 MB
@@ -1207,15 +1209,32 @@ async function switchTrip(name, start, end) {
 function openSettings() {
   setVal('setName', store.get('name'));
   setVal('setPass', store.get('pass'));
+  setErr('');
   show('settings');
 }
 
+function setErr(msg) {
+  $('setErr').textContent = msg;
+  $('setErr').classList.toggle('hidden', !msg);
+}
+
+// 密碼欄是「這支手機記住的密碼」，不是換密碼的地方（真正的密碼在後端）。
+// 有改就先拿新的問後端，對了才存：沒問就存的話，填錯一次，手機裡原本對的那個就被蓋掉、再也看不到。
+// 沒改密碼（只改名字）不用問，沒網路也存得了。
 async function saveSettings() {
   const name = $('setName').value.trim();
   const pass = $('setPass').value.trim();
-  if (!name || !pass) return toast('名字和密碼都要填');
+  if (!name || !pass) return setErr('名字和密碼都要填');
+  if (pass !== store.get('pass')) {
+    busy($('setSave'), true, '確認密碼…');
+    const r = await api('config', { pass });
+    busy($('setSave'), false);
+    if (!r.ok) return setErr(r.code === 'auth' ? '這個密碼不對，沒有儲存。這支手機原本記住的密碼還在。'
+      : `${r.error}，${r.net ? '沒辦法確認新密碼，' : ''}沒有儲存。`);
+    store.set('pass', pass);
+  }
   store.set('name', name);
-  store.set('pass', pass);
+  setErr('');
   hide('settings');
   await refresh();
   retryNow();
